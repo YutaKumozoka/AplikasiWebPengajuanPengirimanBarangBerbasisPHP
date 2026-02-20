@@ -1,0 +1,211 @@
+<?php
+ini_set('session.cookie_httponly', 1);
+ini_set('session.cookie_secure', 0);
+ini_set('session.use_strict_mode', 1);
+session_start();
+require_once '../lib/functions.php';
+require_once '../lib/auth.php';
+requireAuth();
+requireModuleAccess('pengiriman_barang');
+require_once '../config/database.php';
+
+// PERBAIKAN: Parameter GET harus 'pengiriman_id'
+
+$master_id = (int)($_GET['pengiriman_id'] ?? 0);
+if (!$master_id) redirect('index.php');
+
+$error = '';
+
+// Validasi apakah pengiriman master ada dan belum selesai
+$master_check = mysqli_query($connection, "SELECT * FROM `pengiriman_barang` WHERE id = $master_id");
+if (mysqli_num_rows($master_check) == 0) {
+    redirect('index.php');
+}
+
+$master_data = mysqli_fetch_assoc($master_check);
+// Cek status master, jika sudah SELESAI tidak boleh tambah item
+if ($master_data['status'] === 'SELESAI') {
+    $error = "Pengiriman ini sudah selesai, tidak dapat menambahkan item.";
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($error)) {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        $_SESSION['error_message'] = 'Invalid CSRF token.';
+        redirect("tambah_item.php?pengiriman_id=$master_id");
+    }
+    
+    // Ambil data dari POST
+    $barang_id = (int)($_POST['barang_id'] ?? 0);
+    $qty = (float)($_POST['qty'] ?? 0);
+    
+    // Validasi input
+    if ($barang_id <= 0) {
+        $error = "Barang Id wajib dipilih.";
+    } elseif ($qty <= 0) {
+        $error = "Qty harus lebih dari 0.";
+    }
+    
+    if (!$error) {
+        // Ambil harga dari tabel barang
+        $barang_query = mysqli_query($connection, "SELECT harga, nama_barang FROM barang WHERE id = $barang_id");
+        if (mysqli_num_rows($barang_query) == 0) {
+            $error = "Barang tidak ditemukan.";
+        } else {
+            $barang_data = mysqli_fetch_assoc($barang_query);
+            $harga = (float)$barang_data['harga'];
+            $subtotal = $qty * $harga;
+            
+            // Check for duplicate
+            $check_stmt = mysqli_prepare($connection, 
+                "SELECT id FROM `pengiriman_detail` WHERE `pengiriman_id` = ? AND `barang_id` = ?");
+            mysqli_stmt_bind_param($check_stmt, "ii", $master_id, $barang_id);
+            mysqli_stmt_execute($check_stmt);
+            mysqli_stmt_store_result($check_stmt);
+            
+            if (mysqli_stmt_num_rows($check_stmt) > 0) {
+                $error = "Barang '{$barang_data['nama_barang']}' sudah ditambahkan ke pengiriman ini.";
+            }
+            mysqli_stmt_close($check_stmt);
+            
+            if (!$error) {
+                // Prepare INSERT statement
+                $stmt = mysqli_prepare($connection, 
+                    "INSERT INTO `pengiriman_detail` (`pengiriman_id`, `barang_id`, `qty`, `harga`, `subtotal`) VALUES (?, ?, ?, ?, ?)");
+                mysqli_stmt_bind_param($stmt, "iiddd", $master_id, $barang_id, $qty, $harga, $subtotal);
+                
+                if (mysqli_stmt_execute($stmt)) {
+                    mysqli_stmt_close($stmt);
+                    
+                    // FIXED: Gunakan fungsi updateTotalPengiriman yang baru
+                    $success = updateTotalPengiriman($connection, $master_id);
+                    
+                    if ($success) {
+                        $_SESSION['success_message'] = "Item '{$barang_data['nama_barang']}' berhasil ditambahkan.";
+                    } else {
+                        $_SESSION['warning_message'] = "Item berhasil ditambahkan, tetapi ada masalah saat update total.";
+                    }
+                    
+                    redirect("detail.php?id=$master_id");
+                    exit();
+                } else {
+                    $error = "Gagal menyimpan item: " . mysqli_error($connection);
+                }
+            }
+        }
+    }
+}
+
+$csrfToken = generateCSRFToken();
+?>
+<?php include '../views/'.$THEME.'/header.php'; ?>
+<?php include '../views/'.$THEME.'/sidebar.php'; ?>
+<?php include '../views/'.$THEME.'/topnav.php'; ?>
+<?php include '../views/'.$THEME.'/upper_block.php'; ?>
+
+<div class="card">
+    <div class="card-header">
+        <h4 class="mb-0">
+            <i class="fas fa-cube me-2"></i>Tambah Item ke Pengiriman Barang #<?= $master_id ?>
+        </h4>
+    </div>
+    <div class="card-body">
+        <?php 
+        if (!empty($error) || isset($_SESSION['error_message'])): 
+            $error_msg = !empty($error) ? $error : ($_SESSION['error_message'] ?? '');
+            unset($_SESSION['error_message']);
+        ?>
+            <div class="alert alert-danger">
+                <i class="fas fa-exclamation-triangle me-2"></i><?= htmlspecialchars($error_msg) ?>
+            </div>
+        <?php endif; ?>
+
+        <?php if ($master_data['status'] === 'SELESAI'): ?>
+            <div class="alert alert-warning">
+                <i class="fas fa-info-circle me-2"></i>Pengiriman ini sudah selesai, tidak dapat menambahkan item.
+                <div class="mt-2">
+                    <a href="detail.php?id=<?= $master_id ?>" class="btn btn-sm btn-secondary">
+                        <i class="fas fa-arrow-left me-1"></i>Kembali ke Detail
+                    </a>
+                </div>
+            </div>
+        <?php else: ?>
+            <form method="POST" class="needs-validation" novalidate>
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
+                
+                <div class="row">
+                    <div class="col-md-6 mb-3">
+                        <label class="form-label">Barang*</label>
+                        <?php
+                        echo dropdownFromTable(
+                            'barang',               // table name
+                            'id',                   // value field
+                            'nama_barang',          // label field
+                            '',                     // selected
+                            'barang_id',            // HTML name
+                            '-- Pilih Barang --',   // placeholder
+                            'nama_barang'           // order by
+                        ); 
+                        ?>
+                        <div class="form-text">Pilih barang yang akan dikirim</div>
+                    </div>
+                    
+                    <div class="col-md-6 mb-3">
+                        <label class="form-label">Quantity (Qty)*</label>
+                        <div class="input-group">
+                            <input type="number" name="qty" class="form-control" min="1" step="1" value="1" required>
+                            <span class="input-group-text">unit</span>
+                        </div>
+                        <div class="invalid-feedback">Harap isi quantity dengan angka positif</div>
+                    </div>
+                </div>
+                
+                <div class="mb-4">
+                    <div class="alert alert-info">
+                        <div class="d-flex">
+                            <div class="me-3">
+                                <i class="fas fa-info-circle fa-2x"></i>
+                            </div>
+                            <div>
+                                <strong>Informasi:</strong>
+                                <ul class="mb-0 mt-1">
+                                    <li>Harga akan otomatis diambil dari data barang yang dipilih</li>
+                                    <li>Subtotal = Harga × Quantity</li>
+                                    <li>Total pengiriman akan otomatis diupdate setelah menambah item</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="d-flex gap-2">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-plus-circle me-1"></i>Tambah Item
+                    </button>
+                    <a href="detail.php?id=<?= $master_id ?>" class="btn btn-secondary">
+                        <i class="fas fa-times me-1"></i>Batal
+                    </a>
+                </div>
+            </form>
+            
+            <!-- Script untuk validasi form -->
+            <script>
+            (function() {
+                'use strict';
+                var forms = document.querySelectorAll('.needs-validation');
+                Array.prototype.slice.call(forms).forEach(function(form) {
+                    form.addEventListener('submit', function(event) {
+                        if (!form.checkValidity()) {
+                            event.preventDefault();
+                            event.stopPropagation();
+                        }
+                        form.classList.add('was-validated');
+                    }, false);
+                });
+            })();
+            </script>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php include '../views/'.$THEME.'/lower_block.php'; ?>
+<?php include '../views/'.$THEME.'/footer.php'; ?>
